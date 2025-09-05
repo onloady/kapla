@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D 카플라 블럭 - 부드러운 UX</title>
+<style>
+body { margin:0; overflow:hidden; }
+canvas { display:block; }
+#ui { position: absolute; top:10px; left:10px; z-index:10; background: rgba(255,255,255,0.9); padding:5px; border-radius:5px; }
+button,input { padding:4px 6px; font-size:14px; margin:2px; }
+</style>
+</head>
+<body>
+<div id="ui">
+<button id="spawnBtn">블럭 가져오기</button>
+<button id="deleteBtn">선택 블럭 삭제</button>
+<button id="undoBtn">이전 단계 되돌리기</button>
+<button id="saveMemoryBtn">공유 저장</button><br>
+<label>X° <input type="number" id="rotX" step="1"></label>
+<label>Y° <input type="number" id="rotY" step="1"></label>
+<label>Z° <input type="number" id="rotZ" step="1"></label>
+<button id="applyRotBtn">회전 적용</button><br>
+<label>정n각형 n: <input type="number" id="polygonN" min="3" value="6"></label>
+<button id="drawPolygonBtn">정n각형 생성</button><br>
+<div>블럭 개수: <span id="blockCount">0</span></div>
+</div>
+
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.149.0/build/three.module.js';
+
+// --- 씬/카메라/렌더러 ---
+const scene = new THREE.Scene(); scene.background=0xcccccc;
+const camera=new THREE.PerspectiveCamera(45,window.innerWidth/window.innerHeight,0.1,1000);
+let radius=60,theta=Math.PI/4,phi=Math.PI/4; const target=new THREE.Vector3(0,0,0);
+function updateCamera(){ camera.position.x=radius*Math.sin(phi)*Math.cos(theta); camera.position.y=radius*Math.cos(phi); camera.position.z=radius*Math.sin(phi)*Math.sin(theta); camera.lookAt(target);}
+updateCamera();
+const renderer=new THREE.WebGLRenderer({antialias:true}); renderer.setSize(window.innerWidth,window.innerHeight); document.body.appendChild(renderer.domElement);
+
+// --- 라이트 ---
+const light=new THREE.DirectionalLight(0xffffff,1); light.position.set(50,80,50); scene.add(light);
+
+// --- 바닥 ---
+const floor=new THREE.Mesh(new THREE.PlaneGeometry(200,200), new THREE.MeshStandardMaterial({color:0x888888}));
+floor.rotation.x=-Math.PI/2; scene.add(floor);
+
+// --- 축 ---
+function createAxis(length=50){
+    const axes=new THREE.Group(); const mat=new THREE.LineBasicMaterial({color:0x000000});
+    const lines=[[-length,0,0,length,0,0],[0,-length,0,0,length,0],[0,0,-length,0,0,length]];
+    lines.forEach(l=>{
+        const pts=[new THREE.Vector3(l[0],l[1],l[2]), new THREE.Vector3(l[3],l[4],l[5])];
+        axes.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),mat));
+    });
+    scene.add(axes);
+}
+createAxis(100);
+
+// --- 블럭 ---
+const BLOCK_LENGTH=15,BLOCK_WIDTH=3,BLOCK_HEIGHT=1;
+const blocks=[], undoStack=[];
+let previewBlock=null, selectedBlock=null;
+function updateBlockCount(){ document.getElementById('blockCount').innerText=blocks.length; }
+
+function isColliding(x,y,z,exclude=null){
+    for(const b of blocks){ if(b===exclude) continue; if(Math.abs(b.position.x-x)<BLOCK_LENGTH && Math.abs(b.position.y-y)<BLOCK_HEIGHT && Math.abs(b.position.z-z)<BLOCK_WIDTH) return true; }
+    return false;
+}
+
+function applyZTilt(block){
+    for(const b of blocks){
+        if(b===block) continue;
+        const xOverlap=Math.max(0, Math.min(block.position.x+BLOCK_LENGTH/2,b.position.x+BLOCK_LENGTH/2)-Math.max(block.position.x-BLOCK_LENGTH/2,b.position.x-BLOCK_LENGTH/2));
+        const zOverlap=Math.max(0, Math.min(block.position.z+BLOCK_WIDTH/2,b.position.z+BLOCK_WIDTH/2)-Math.max(block.position.z-BLOCK_WIDTH/2,b.position.z-BLOCK_WIDTH/2));
+        if(xOverlap>0 && zOverlap>0 && Math.abs(block.position.y-b.position.y)<BLOCK_HEIGHT+0.01){
+            const centerDiff=block.position.x-b.position.x;
+            block.rotation.z = Math.abs(centerDiff)<0.2 ? 0 : (centerDiff>0?-4:4)*Math.PI/180;
+            return;
+        }
+    }
+    block.rotation.z=0;
+}
+
+function createBlock(x,y,z,rotate=false, saveUndo=true){
+    let finalY=y;
+    for(const b of blocks){ if(Math.abs(b.position.x-x)<BLOCK_LENGTH && Math.abs(b.position.z-z)<BLOCK_WIDTH) finalY=Math.max(finalY,b.position.y+BLOCK_HEIGHT); }
+    const geometry=new THREE.BoxGeometry(BLOCK_LENGTH,BLOCK_HEIGHT,BLOCK_WIDTH);
+    const material=new THREE.MeshStandardMaterial({color:0xD2A679});
+    const block=new THREE.Mesh(geometry,material);
+    block.position.set(x,finalY,z); if(rotate) block.rotation.y=Math.PI/2;
+    applyZTilt(block);
+    scene.add(block);
+    const edges=new THREE.EdgesGeometry(geometry);
+    const line=new THREE.LineSegments(edges,new THREE.LineBasicMaterial({color:0x000000}));
+    line.position.copy(block.position); line.rotation.copy(block.rotation);
+    scene.add(line); block.userData.line=line;
+    blocks.push(block); if(saveUndo) undoStack.push({type:'add', object:block});
+    updateBlockCount(); return block;
+}
+
+// --- UI ---
+document.getElementById('spawnBtn').addEventListener('click',()=>{
+    if(previewBlock){ scene.remove(previewBlock.userData.line); scene.remove(previewBlock); }
+    const geo=new THREE.BoxGeometry(BLOCK_LENGTH,BLOCK_HEIGHT,BLOCK_WIDTH);
+    const mat=new THREE.MeshStandardMaterial({color:0xD2A679,opacity:0.6,transparent:true});
+    previewBlock=new THREE.Mesh(geo,mat); previewBlock.position.set(0,BLOCK_HEIGHT/2,0);
+    scene.add(previewBlock);
+    const edges=new THREE.EdgesGeometry(geo);
+    const line=new THREE.LineSegments(edges,new THREE.LineBasicMaterial({color:0x000000}));
+    line.position.copy(previewBlock.position); scene.add(line); previewBlock.userData.line=line;
+});
+
+document.getElementById('deleteBtn').addEventListener('click',()=>{
+    if(selectedBlock){ undoStack.push({type:'remove', object:selectedBlock}); scene.remove(selectedBlock.userData.line); scene.remove(selectedBlock); const idx=blocks.indexOf(selectedBlock); if(idx!==-1) blocks.splice(idx,1); selectedBlock=null; updateBlockCount();}
+});
+
+document.getElementById('undoBtn').addEventListener('click',()=>{
+    if(undoStack.length===0) return; const last=undoStack.pop();
+    if(last.type==='add'){ scene.remove(last.object.userData.line); scene.remove(last.object); const idx=blocks.indexOf(last.object); if(idx!==-1) blocks.splice(idx,1);}
+    else if(last.type==='remove'){ scene.add(last.object); scene.add(last.object.userData.line); blocks.push(last.object); applyZTilt(last.object);}
+    updateBlockCount();
+});
+
+document.getElementById('applyRotBtn').addEventListener('click',()=>{
+    if(!selectedBlock) return;
+    const x=THREE.MathUtils.degToRad(Number(document.getElementById('rotX').value)||0);
+    const y=THREE.MathUtils.degToRad(Number(document.getElementById('rotY').value)||0);
+    const z=THREE.MathUtils.degToRad(Number(document.getElementById('rotZ').value)||0);
+    selectedBlock.rotation.set(x,y,z); selectedBlock.userData.line.rotation.copy(selectedBlock.rotation); applyZTilt(selectedBlock);
+});
+
+// --- 정n각형 ---
+function getRadius(n){ return BLOCK_LENGTH/(2*Math.sin(Math.PI/n)); }
+document.getElementById('drawPolygonBtn').addEventListener('click',()=>{
+    const n=Math.max(3,Number(document.getElementById('polygonN').value)||3); const angleStep=2*Math.PI/n; const radius=getRadius(n);
+    const points=[]; for(let i=0;i<n;i++){ const angle=i*angleStep; points.push({x:radius*Math.sin(angle), z:-radius*Math.cos(angle)}); }
+    const y0=BLOCK_HEIGHT/2; for(let i=0;i<n;i++){
+        const A=points[i], B=points[(i+1)%n]; const x=(A.x+B.x)/2, z=(A.z+B.z)/2; const dx=B.x-A.x, dz=B.z-A.z; const rotY=Math.atan2(dx,dz);
+        const block=createBlock(x,y0,z,false); block.rotation.set(0,rotY,0); block.userData.line.rotation.copy(block.rotation); applyZTilt(block);
+    }
+});
+
+// --- 공유 저장 ---
+document.getElementById('saveMemoryBtn').addEventListener('click',async()=>{
+    const data=blocks.map(b=>({position:{x:b.position.x,y:b.position.y,z:b.position.z}, rotation:{x:b.rotation.x,y:b.rotation.y,z:b.rotation.z}}));
+    await fetch('/save',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+    alert('공유 저장 완료');
+});
+
+// --- 공유 불러오기 ---
+async function loadSharedState(){
+    const res=await fetch('/load'); const saved=await res.json();
+    if(!saved || saved.length===0) return; blocks.forEach(b=>{ scene.remove(b.userData.line); scene.remove(b); }); blocks.length=0;
+    for(const bData of saved){
+        const block=createBlock(bData.position.x,bData.position.y,bData.position.z,false,false);
+        block.rotation.set(bData.rotation.x,bData.rotation.y,bData.rotation.z); block.userData.line.rotation.copy(block.rotation); applyZTilt(block);
+    }
+}
+loadSharedState();
+
+// --- 마우스/카메라 드래그 ---
+const raycaster=new THREE.Raycaster(), mouse=new THREE.Vector2();
+let isDragging=false,isCameraDragging=false, prevX=0,prevY=0;
+
+renderer.domElement.addEventListener('mousedown', e=>{
+    prevX=e.clientX; prevY=e.clientY; mouse.x=(e.clientX/window.innerWidth)*2-1; mouse.y=-(e.clientY/window.innerHeight)*2+1; raycaster.setFromCamera(mouse,camera);
+    if(previewBlock) isDragging=true;
+    else{
+        const intersects=raycaster.intersectObjects(blocks);
+        if(intersects.length>0){ if(selectedBlock) selectedBlock.userData.line.material.color.set(0x000000); selectedBlock=intersects[0].object; selectedBlock.userData.line.material.color.set(0xff0000); isDragging=true;}
+        else { if(selectedBlock) selectedBlock.userData.line.material.color.set(0x000000); selectedBlock=null; isCameraDragging=true;}
+    }
+});
+
+renderer.domElement.addEventListener('mouseup',()=>{
+    if(isDragging && previewBlock){ createBlock(previewBlock.position.x,previewBlock.position.y,previewBlock.position.z,previewBlock.rotation.y!==0); scene.remove(previewBlock.userData.line); scene.remove(previewBlock); previewBlock=null; }
+    isDragging=false; isCameraDragging=false;
+});
+
+renderer.domElement.addEventListener('mousemove', e=>{
+    const dx=e.clientX-prevX, dy=e.clientY-prevY; prevX=e.clientX; prevY=e.clientY;
+    if(isDragging && previewBlock){
+        mouse.x=(e.clientX/window.innerWidth)*2-1; mouse.y=-(e.clientY/window.innerHeight)*2+1; raycaster.setFromCamera(mouse,camera);
+        const intersects=raycaster.intersectObjects(blocks.concat([floor]));
+        if(intersects.length>0){ const p=intersects[0].point; previewBlock.position.x=p.x; previewBlock.position.z=p.z;
+            let maxY=BLOCK_HEIGHT/2; for(const b of blocks){ if(Math.abs(b.position.x-p.x)<BLOCK_LENGTH && Math.abs(b.position.z-p.z)<BLOCK_WIDTH) maxY=Math.max(maxY,b.position.y+BLOCK_HEIGHT); }
+            previewBlock.position.y=maxY; if(!isColliding(previewBlock.position.x,previewBlock.position.y,previewBlock.position.z)) previewBlock.userData.line.position.copy(previewBlock.position);
+        }
+    } else if(isDragging && selectedBlock){
+        mouse.x=(e.clientX/window.innerWidth)*2-1; mouse.y=-(e.clientY/window.innerHeight)*2+1; raycaster.setFromCamera(mouse,camera);
+        const intersects=raycaster.intersectObject(floor); if(intersects.length>0){
+            const p=intersects[0].point; let newX=p.x,newZ=p.z,maxY=BLOCK_HEIGHT/2;
+            for(const b of blocks){ if(b===selectedBlock) continue; if(Math.abs(b.position.x-newX)<BLOCK_LENGTH && Math.abs(b.position.z-newZ)<BLOCK_WIDTH) maxY=Math.max(maxY,b.position.y+BLOCK_HEIGHT); }
+            const newY=maxY; if(!isColliding(newX,newY,newZ,selectedBlock)){ selectedBlock.position.set(newX,newY,newZ); applyZTilt(selectedBlock); selectedBlock.userData.line.position.copy(selectedBlock.position); selectedBlock.userData.line.rotation.copy(selectedBlock.rotation);}
+        }
+    } else if(isCameraDragging){ theta+=dx*0.005; phi-=dy*0.005; phi=Math.max(0.1,Math.min(Math.PI-0.1,phi)); updateCamera();}
+});
+
+renderer.domElement.addEventListener('wheel',e=>{ radius+=e.deltaY*0.05; radius=Math.max(10,Math.min(200,radius)); updateCamera(); });
+
+function animate(){ requestAnimationFrame(animate); renderer.render(scene,camera);}
+animate(); window.addEventListener('resize',()=>{ camera.aspect=window.innerWidth/window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth,window.innerHeight); });
+
+</script>
+</body>
+</html>
